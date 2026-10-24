@@ -1,0 +1,758 @@
+<?xml version='1.0' standalone='yes'?>
+<!DOCTYPE PLUGIN [
+<!ENTITY name      "sbomgen">
+<!ENTITY author    "UnheardOTP">
+<!ENTITY version   "2026.10.23b">
+<!ENTITY pluginURL "https://raw.githubusercontent.com/UnheardOTP/unraid-sbomgen/main/sbomgen.plg">
+]>
+<PLUGIN name="&name;" author="&author;" version="&version;" pluginURL="&pluginURL;" min="6.12.0" icon="list-alt" support="https://github.com/UnheardOTP/unraid-sbomgen/issues">
+
+<CHANGES>
+###&version;
+- CycloneDX SBOMs for the Unraid OS (Slackware packages, kernel, release), host filesystem and containers
+- Grype vulnerability scan, CISA KEV tagging, new-since-last-run diff, Unraid notifications
+- Optional Dependency-Track upload
+</CHANGES>
+
+<!-- Pre-install: clear the previous version's runtime files -->
+<FILE Run="/bin/bash">
+<INLINE>
+rm -rf /usr/local/emhttp/plugins/&name;
+mkdir -p /usr/local/emhttp/plugins/&name;/scripts /boot/config/plugins/&name;/bin
+</INLINE>
+</FILE>
+
+<FILE Name="/usr/local/emhttp/plugins/&name;/default.cfg" Mode="0644">
+<INLINE><![CDATA[
+OUTPUT_DIR="/mnt/user/appdata/sbomgen"
+SCHEDULE="weekly"
+SCHED_DOW="0"
+SCHED_HOUR="3"
+SCHED_MIN="17"
+SCAN_HOST_OS="yes"
+SCAN_HOST_FS="yes"
+SCAN_CONTAINERS="yes"
+VULN_SCAN="yes"
+KEEP_RUNS="12"
+NOTIFY="new"
+DT_URL=""
+DT_API_KEY=""
+]]></INLINE>
+</FILE>
+
+<FILE Name="/usr/local/emhttp/plugins/&name;/SBOMGen.page" Mode="0644">
+<INLINE><![CDATA[
+Menu="Utilities"
+Title="SBOM Generator"
+Icon="list-alt"
+---
+<?php
+$cfg = parse_plugin_cfg('sbomgen');
+$h   = fn($s) => htmlspecialchars((string)$s, ENT_QUOTES);
+$out = rtrim($cfg['OUTPUT_DIR'], '/');
+
+$tool = function ($t) {
+  $v = @shell_exec("/usr/local/sbomgen/bin/$t version 2>/dev/null | awk '/^Version:/{print \$2}'");
+  return trim((string)$v) ?: 'not installed';
+};
+$status = trim((string)@file_get_contents("$out/status")) ?: 'no scans yet';
+// "finished 20261023-170950 errors=0 new=..." -> "finished 2026-10-23 17:09:50, 0 errors"
+if (preg_match('/^(running|finished) (\d{4})(\d\d)(\d\d)-(\d\d)(\d\d)(\d\d)(?: errors=(\d+))?/', $status, $m)) {
+  $status = "$m[1] $m[2]-$m[3]-$m[4] $m[5]:$m[6]:$m[7]" . (isset($m[8]) ? ", $m[8] error" . ($m[8] === '1' ? '' : 's') : '');
+}
+$stats  = json_decode((string)@file_get_contents("$out/latest/summary.json"), true)['stats'] ?? null;
+$sel    = fn($k, $v) => ($cfg[$k] ?? '') === (string)$v ? ' selected' : '';
+$days   = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+?>
+<style>
+.sbom-stat{display:inline-block;margin-right:2em}
+.sbom-stat b{font-size:1.4em}
+.sbom-kev b{color:#e22828}
+</style>
+
+<div markdown="1">
+**Status:** <?=$h($status)?>
+&nbsp;·&nbsp; Syft <?=$h($tool('syft'))?> &nbsp;·&nbsp; Grype <?=$h($tool('grype'))?>
+
+<?if ($stats):?>
+<span class="sbom-stat sbom-kev"><b><?=$h($stats['kev'])?></b> known exploited</span>
+<span class="sbom-stat"><b><?=$h($stats['critical'])?></b> critical</span>
+<span class="sbom-stat"><b><?=$h($stats['high'])?></b> high</span>
+<span class="sbom-stat"><b><?=$h($stats['new'])?></b> new since previous scan</span>
+
+Latest report: <code><?=$h("$out/latest/summary.md")?></code>
+
+<input type="button" value="Download report" title="Markdown summary: KEV and new findings first" onclick="location.href='/plugins/sbomgen/download.php?f=md'">
+<input type="button" value="Download findings (CSV)" title="Every finding, for sorting and filtering in a spreadsheet" onclick="location.href='/plugins/sbomgen/download.php?f=csv'">
+<input type="button" value="Download everything" title="SBOMs, Grype results, report and log as .tar.gz" onclick="location.href='/plugins/sbomgen/download.php?f=tgz'">
+<?endif;?>
+</div>
+
+<form markdown="1" method="POST" action="/update.php" target="progressFrame">
+<input type="hidden" name="#command" value="/plugins/sbomgen/scripts/action.sh">
+<input type="hidden" name="#arg[1]" value="scan">
+&nbsp;
+: <input type="submit" value="Scan now"> <span class="inline-help">Runs in the background; refresh this page to see the result.</span>
+</form>
+
+<form markdown="1" method="POST" action="/update.php" target="progressFrame">
+<input type="hidden" name="#command" value="/plugins/sbomgen/scripts/action.sh">
+<input type="hidden" name="#arg[1]" value="update">
+&nbsp;
+: <input type="submit" value="Update tools"> <span class="inline-help">Fetches the latest Syft and Grype releases and verifies their checksums.</span>
+</form>
+
+<form markdown="1" method="POST" action="/update.php" target="progressFrame">
+<input type="hidden" name="#file" value="sbomgen/sbomgen.cfg">
+<input type="hidden" name="#command" value="/plugins/sbomgen/scripts/apply.sh">
+
+### What to inventory
+
+Unraid OS packages:
+: <select name="SCAN_HOST_OS"><option value="yes"<?=$sel('SCAN_HOST_OS','yes')?>>Yes</option><option value="no"<?=$sel('SCAN_HOST_OS','no')?>>No</option></select>
+
+> Slackware packages, kernel and Unraid release, built directly from the package database.
+
+Host filesystem:
+: <select name="SCAN_HOST_FS"><option value="yes"<?=$sel('SCAN_HOST_FS','yes')?>>Yes</option><option value="no"<?=$sel('SCAN_HOST_FS','no')?>>No</option></select>
+
+> Syft scan of the root filesystem (Python, Go, Java and other artifacts outside the package database). Excludes /mnt, /boot and Docker/VM storage.
+
+Docker containers:
+: <select name="SCAN_CONTAINERS"><option value="yes"<?=$sel('SCAN_CONTAINERS','yes')?>>Yes</option><option value="no"<?=$sel('SCAN_CONTAINERS','no')?>>No</option></select>
+
+> One SBOM per image in use, including stopped containers.
+
+### Vulnerability scanning
+
+Scan with Grype:
+: <select name="VULN_SCAN"><option value="yes"<?=$sel('VULN_SCAN','yes')?>>Yes</option><option value="no"<?=$sel('VULN_SCAN','no')?>>No (SBOMs only)</option></select>
+
+Notify:
+: <select name="NOTIFY">
+  <option value="new"<?=$sel('NOTIFY','new')?>>When new vulnerabilities appear</option>
+  <option value="always"<?=$sel('NOTIFY','always')?>>After every scan</option>
+  <option value="off"<?=$sel('NOTIFY','off')?>>Never</option>
+  </select>
+
+### Schedule
+
+Run:
+: <select name="SCHEDULE"><option value="daily"<?=$sel('SCHEDULE','daily')?>>Daily</option><option value="weekly"<?=$sel('SCHEDULE','weekly')?>>Weekly</option><option value="off"<?=$sel('SCHEDULE','off')?>>Manually only</option></select>
+
+Day (weekly):
+: <select name="SCHED_DOW"><?foreach($days as $i=>$d):?><option value="<?=$i?>"<?=$sel('SCHED_DOW',$i)?>><?=$d?></option><?endforeach;?></select>
+
+Time (24h):
+: <input type="number" name="SCHED_HOUR" min="0" max="23" value="<?=$h($cfg['SCHED_HOUR'])?>" style="width:5em"> : <input type="number" name="SCHED_MIN" min="0" max="59" value="<?=$h($cfg['SCHED_MIN'])?>" style="width:5em">
+
+### Storage
+
+Output folder:
+: <input type="text" name="OUTPUT_DIR" value="<?=$h($cfg['OUTPUT_DIR'])?>" style="width:24em">
+
+> Use a share on the array or a pool. The Grype database (several hundred MB) lives here too, never on the flash drive.
+
+Keep runs:
+: <input type="number" name="KEEP_RUNS" min="0" value="<?=$h($cfg['KEEP_RUNS'])?>" style="width:5em"> <span class="inline-help">0 keeps everything</span>
+
+### Dependency-Track (optional)
+
+Server URL:
+: <input type="text" name="DT_URL" value="<?=$h($cfg['DT_URL'])?>" placeholder="http://tower:8081" style="width:24em">
+
+API key:
+: <input type="password" name="DT_API_KEY" value="<?=$h($cfg['DT_API_KEY'])?>" autocomplete="off" style="width:24em">
+
+> Needs BOM_UPLOAD and PROJECT_CREATION_UPLOAD permissions. Each SBOM becomes its own project, versioned "current" so it updates in place.
+
+&nbsp;
+: <input type="submit" name="#apply" value="Apply"><input type="button" value="Done" onclick="done()">
+</form>
+]]></INLINE>
+</FILE>
+
+<FILE Name="/usr/local/emhttp/plugins/&name;/download.php" Mode="0644">
+<INLINE><![CDATA[
+<?php
+// Serves files from the latest scan run to the settings page.
+//   ?f=md   summary.md
+//   ?f=csv  every finding as CSV (built from summary.json)
+//   ?f=tgz  the whole run folder: SBOMs, Grype results, summary, log
+// Only these fixed outputs are served, and only from inside <output>/runs/.
+
+$cfg = [];
+foreach (['/usr/local/emhttp/plugins/sbomgen/default.cfg', '/boot/config/plugins/sbomgen/sbomgen.cfg'] as $f) {
+  if (is_readable($f)) $cfg = array_merge($cfg, parse_ini_file($f, false, INI_SCANNER_RAW) ?: []);
+}
+$out  = rtrim($cfg['OUTPUT_DIR'] ?? '', '/');
+$runs = realpath("$out/runs");
+$run  = realpath("$out/latest");
+
+function fail(int $code, string $msg) {
+  http_response_code($code);
+  header('Content-Type: text/plain');
+  exit($msg);
+}
+
+if (!$runs || !$run || !is_dir($run) || dirname($run) !== $runs) fail(404, 'No completed scan found.');
+$name = 'sbom-' . basename($run);   // e.g. sbom-20261023-170950
+header('X-Content-Type-Options: nosniff');
+header('Cache-Control: no-store');
+
+switch ($_GET['f'] ?? '') {
+  case 'md':
+    if (!is_readable("$run/summary.md")) fail(404, 'This run has no report (vulnerability scanning was off).');
+    header('Content-Type: text/markdown; charset=utf-8');
+    header("Content-Disposition: attachment; filename=\"$name-report.md\"");
+    readfile("$run/summary.md");
+    break;
+
+  case 'csv':
+    $data = json_decode((string)@file_get_contents("$run/summary.json"), true);
+    if (!$data) fail(404, 'This run has no findings file (vulnerability scanning was off).');
+    header('Content-Type: text/csv; charset=utf-8');
+    header("Content-Disposition: attachment; filename=\"$name-findings.csv\"");
+    $o = fopen('php://output', 'w');
+    fputcsv($o, ['kev', 'new', 'severity', 'id', 'package', 'version', 'fixed_in', 'target']);
+    foreach ($data['findings'] ?? [] as $f) {
+      fputcsv($o, [$f['kev'] ? 'yes' : '', $f['new'] ? 'yes' : '', $f['severity'], $f['id'],
+                   $f['package'], $f['version'], $f['fixed_in'], $f['target']]);
+    }
+    fclose($o);
+    break;
+
+  case 'tgz':
+    header('Content-Type: application/gzip');
+    header("Content-Disposition: attachment; filename=\"$name.tar.gz\"");
+    passthru('tar -czf - -C ' . escapeshellarg(dirname($run)) . ' ' . escapeshellarg(basename($run)));
+    break;
+
+  default:
+    fail(400, 'Unknown download.');
+}
+]]></INLINE>
+</FILE>
+
+<FILE Name="/usr/local/emhttp/plugins/&name;/scripts/action.sh" Mode="0755">
+<INLINE><![CDATA[
+#!/bin/bash
+# Buttons on the settings page: run a scan or update Syft/Grype in the background.
+S=/usr/local/emhttp/plugins/sbomgen/scripts
+case ${1:-} in
+  scan)   nohup "$S/sbomgen-scan.sh" >/dev/null 2>&1 & ;;
+  update) nohup "$S/install-tools.sh" --update >/var/log/sbomgen-tools.log 2>&1 & ;;
+  *)      echo "usage: $0 scan|update" >&2; exit 1 ;;
+esac
+]]></INLINE>
+</FILE>
+
+<FILE Name="/usr/local/emhttp/plugins/&name;/scripts/apply.sh" Mode="0755">
+<INLINE><![CDATA[
+#!/bin/bash
+# Called by the settings page after saving: rewrites the plugin's cron entry.
+CFG_DIR=/boot/config/plugins/sbomgen
+CRON=$CFG_DIR/sbomgen.cron
+# shellcheck disable=SC1091
+source /usr/local/emhttp/plugins/sbomgen/default.cfg
+# shellcheck disable=SC1091
+[[ -f $CFG_DIR/sbomgen.cfg ]] && source "$CFG_DIR/sbomgen.cfg"
+
+num() { [[ $1 =~ ^[0-9]+$ ]] && echo "$1" || echo "$2"; }
+MIN=$(num "$SCHED_MIN" 17); HOUR=$(num "$SCHED_HOUR" 3); DOW=$(num "$SCHED_DOW" 0)
+JOB="/usr/local/emhttp/plugins/sbomgen/scripts/sbomgen-scan.sh >/dev/null 2>&1"
+
+case $SCHEDULE in
+  daily)  printf '# SBOM Generator\n%s %s * * * %s\n' "$MIN" "$HOUR" "$JOB" >"$CRON" ;;
+  weekly) printf '# SBOM Generator\n%s %s * * %s %s\n' "$MIN" "$HOUR" "$DOW" "$JOB" >"$CRON" ;;
+  *)      rm -f "$CRON" ;;
+esac
+/usr/local/sbin/update_cron
+]]></INLINE>
+</FILE>
+
+<FILE Name="/usr/local/emhttp/plugins/&name;/scripts/host-sbom.php" Mode="0644">
+<INLINE><![CDATA[
+<?php
+// Builds a CycloneDX 1.5 SBOM for the Unraid host OS.
+// Common SBOM tools don't catalog Slackware packages, so this reads them
+// directly from /var/log/packages, adds the kernel and Unraid release, and
+// attaches CPEs for well-known packages so CPE-based matchers
+// (Dependency-Track, Grype where enabled) can find CVEs.
+//
+// Usage: php host-sbom.php [packages_dir] [unraid_version_file]
+
+$pkgDir     = $argv[1] ?? '/var/log/packages';
+$verFile    = $argv[2] ?? '/etc/unraid-version';
+$hostname   = trim(@file_get_contents('/etc/hostname') ?: php_uname('n'));
+$kernel     = php_uname('r');
+
+// Best-effort NVD vendor:product for packages that matter most on a NAS.
+// Anything not listed still appears in the SBOM, just without a CPE.
+$cpeMap = [
+  'openssl' => 'openssl:openssl',      'openssl-solibs' => 'openssl:openssl',
+  'openssh' => 'openbsd:openssh',      'curl' => 'haxx:curl',
+  'samba' => 'samba:samba',            'rsync' => 'samba:rsync',
+  'php' => 'php:php',                  'glibc' => 'gnu:glibc',
+  'aaa_glibc-solibs' => 'gnu:glibc',   'bash' => 'gnu:bash',
+  'sudo' => 'sudo_project:sudo',       'zlib' => 'zlib:zlib',
+  'xz' => 'tukaani:xz',                'sqlite' => 'sqlite:sqlite',
+  'libxml2' => 'xmlsoft:libxml2',      'expat' => 'libexpat_project:libexpat',
+  'qemu' => 'qemu:qemu',               'libvirt' => 'redhat:libvirt',
+  'containerd' => 'linuxfoundation:containerd', 'runc' => 'linuxfoundation:runc',
+  'avahi' => 'avahi:avahi',            'dnsmasq' => 'thekelleys:dnsmasq',
+  'gnutls' => 'gnu:gnutls',            'libssh2' => 'libssh2:libssh2',
+  'nfs-utils' => 'linux-nfs:nfs-utils', 'wget' => 'gnu:wget',
+  'git' => 'git-scm:git',              'python3' => 'python:python',
+  'perl' => 'perl:perl',               'busybox' => 'busybox:busybox',
+];
+
+function cpe(string $vp, string $version, string $part = 'a'): string {
+  $v = preg_replace('/[^A-Za-z0-9._\-]/', '_', $version);
+  return "cpe:2.3:$part:$vp:$v:*:*:*:*:*:*:*";
+}
+
+function uuid4(): string {
+  $d = random_bytes(16);
+  $d[6] = chr((ord($d[6]) & 0x0f) | 0x40);
+  $d[8] = chr((ord($d[8]) & 0x3f) | 0x80);
+  return vsprintf('%s%s-%s-%s-%s-%s%s%s', str_split(bin2hex($d), 4));
+}
+
+// Unraid release: /etc/unraid-version contains: version="7.1.4"
+$unraid = 'unknown';
+if (is_readable($verFile) && preg_match('/version="?([^"\s]+)"?/', file_get_contents($verFile), $m)) {
+  $unraid = $m[1];
+}
+
+$components = [];
+
+$components[] = [
+  'type' => 'operating-system', 'bom-ref' => "unraid@$unraid",
+  'name' => 'unraid', 'version' => $unraid, 'supplier' => ['name' => 'Lime Technology'],
+  'purl' => "pkg:generic/lime-technology/unraid@$unraid",
+  'cpe' => cpe('lime-technology:unraid', $unraid, 'o'),
+];
+
+// Kernel: strip Unraid's local suffix (e.g. 6.12.24-Unraid -> 6.12.24) for matching.
+$kver = preg_replace('/-.*$/', '', $kernel);
+$components[] = [
+  'type' => 'operating-system', 'bom-ref' => "linux-kernel@$kernel",
+  'name' => 'linux-kernel', 'version' => $kver,
+  'purl' => "pkg:generic/kernel.org/linux@$kver",
+  'cpe' => cpe('linux:linux_kernel', $kver, 'o'),
+  'properties' => [['name' => 'unraid:kernel-release', 'value' => $kernel]],
+];
+
+// Slackware packages: filename is name-version-arch-build (name may contain dashes).
+$seen = [];
+foreach (glob(rtrim($pkgDir, '/') . '/*') ?: [] as $f) {
+  $parts = explode('-', basename($f));
+  if (count($parts) < 4) continue;
+  $build   = array_pop($parts);
+  $arch    = array_pop($parts);
+  $version = array_pop($parts);
+  $name    = implode('-', $parts);
+  $ref = "slackware/$name@$version";
+  if (isset($seen[$ref])) continue;
+  $seen[$ref] = true;
+
+  $c = [
+    'type' => 'library', 'bom-ref' => $ref, 'name' => $name, 'version' => $version,
+    'purl' => 'pkg:generic/slackware/' . rawurlencode($name) . '@' . rawurlencode($version)
+              . '?arch=' . rawurlencode($arch),
+    'properties' => [
+      ['name' => 'slackware:arch',  'value' => $arch],
+      ['name' => 'slackware:build', 'value' => $build],
+    ],
+  ];
+  if (isset($cpeMap[$name])) $c['cpe'] = cpe($cpeMap[$name], $version);
+  $components[] = $c;
+}
+
+$bom = [
+  'bomFormat' => 'CycloneDX',
+  'specVersion' => '1.5',
+  'serialNumber' => 'urn:uuid:' . uuid4(),
+  'version' => 1,
+  'metadata' => [
+    'timestamp' => gmdate('Y-m-d\TH:i:s\Z'),
+    'tools' => ['components' => [['type' => 'application', 'name' => 'unraid-sbomgen']]],
+    'component' => [
+      'type' => 'device', 'bom-ref' => "host:$hostname", 'name' => $hostname,
+      'version' => $unraid, 'description' => "Unraid $unraid server, kernel $kernel",
+    ],
+  ],
+  'components' => $components,
+  'dependencies' => [[
+    'ref' => "host:$hostname",
+    'dependsOn' => array_column($components, 'bom-ref'),
+  ]],
+];
+
+echo json_encode($bom, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n";
+]]></INLINE>
+</FILE>
+
+<FILE Name="/usr/local/emhttp/plugins/&name;/scripts/install-tools.sh" Mode="0755">
+<INLINE><![CDATA[
+#!/bin/bash
+# Installs Syft and Grype for the plugin.
+#   install-tools.sh           use the cached release on the flash drive; download latest only if none is cached
+#   install-tools.sh --update  resolve the latest GitHub release and replace the cache if it's newer
+# Downloads are verified against each release's published SHA-256 checksums.
+# Tarballs are cached on the flash drive so the tools come back after a reboot
+# without network access; the binaries themselves run from RAM.
+
+set -uo pipefail
+CACHE=/boot/config/plugins/sbomgen/bin
+BIN=/usr/local/sbomgen/bin
+UPDATE=${1:-}
+mkdir -p "$CACHE" "$BIN"
+
+say() { echo "$*"; logger -t sbomgen -- "$*"; }
+
+latest_version() {   # follows the /releases/latest redirect; avoids GitHub API rate limits
+  curl -fsSLI --max-time 30 -o /dev/null -w '%{url_effective}' "https://github.com/anchore/$1/releases/latest" \
+    | sed -n 's#.*/tag/v\([0-9][0-9.]*\)$#\1#p'
+}
+
+install_one() {
+  local tool=$1 cached ver tgz sums tmp
+  cached=$(ls "$CACHE/${tool}_"*_linux_amd64.tar.gz 2>/dev/null | sort -V | tail -n1)
+
+  if [[ -z $cached || $UPDATE == --update ]]; then
+    ver=$(latest_version "$tool")
+    if [[ -z $ver ]]; then
+      say "$tool: could not resolve latest release (offline?)"
+    elif [[ $cached == *"_${ver}_linux_amd64.tar.gz" ]]; then
+      say "$tool $ver already cached"
+    else
+      tgz="${tool}_${ver}_linux_amd64.tar.gz"
+      sums="${tool}_${ver}_checksums.txt"
+      tmp=$(mktemp -d)
+      say "$tool: downloading $ver"
+      if curl -fsSL --max-time 300 -o "$tmp/$tgz"  "https://github.com/anchore/$tool/releases/download/v$ver/$tgz" &&
+         curl -fsSL --max-time 60  -o "$tmp/$sums" "https://github.com/anchore/$tool/releases/download/v$ver/$sums" &&
+         (cd "$tmp" && grep " ${tgz}\$" "$sums" | sha256sum -c --status -); then
+        rm -f "$CACHE/${tool}_"*_linux_amd64.tar.gz
+        mv "$tmp/$tgz" "$CACHE/"
+        cached="$CACHE/$tgz"
+        say "$tool $ver verified and cached"
+      else
+        say "$tool $ver download or checksum verification FAILED; keeping previous version"
+      fi
+      rm -rf "$tmp"
+    fi
+  fi
+
+  if [[ -n $cached && -f $cached ]]; then
+    tar -xzf "$cached" -C "$BIN" "$tool" && chmod 755 "$BIN/$tool"
+    say "$tool installed: $("$BIN/$tool" version 2>/dev/null | awk '/^Version:/{print $2}')"
+  else
+    say "$tool is NOT installed"
+    return 1
+  fi
+}
+
+rc=0
+install_one syft  || rc=1
+install_one grype || rc=1
+exit $rc
+]]></INLINE>
+</FILE>
+
+<FILE Name="/usr/local/emhttp/plugins/&name;/scripts/sbomgen-scan.sh" Mode="0755">
+<INLINE><![CDATA[
+#!/bin/bash
+# SBOM Generator for Unraid - main scan.
+# Produces CycloneDX SBOMs for the Unraid host OS, host filesystem and every
+# container image in use, optionally scans them with Grype, tags CISA KEV
+# matches, diffs against the previous run and uploads to Dependency-Track.
+
+set -uo pipefail
+
+PLUGIN=sbomgen
+EMHTTP=/usr/local/emhttp/plugins/$PLUGIN
+BIN=/usr/local/$PLUGIN/bin
+CFG_DEFAULT=$EMHTTP/default.cfg
+CFG_USER=/boot/config/plugins/$PLUGIN/$PLUGIN.cfg
+NOTIFY_BIN=/usr/local/emhttp/webGui/scripts/notify
+LOCK=/var/run/$PLUGIN.lock
+
+# --- config -----------------------------------------------------------------
+# shellcheck disable=SC1090
+source "$CFG_DEFAULT"
+# shellcheck disable=SC1090
+[[ -f $CFG_USER ]] && source "$CFG_USER"
+
+export SYFT_CHECK_FOR_APP_UPDATE=false
+export GRYPE_CHECK_FOR_APP_UPDATE=false
+export GRYPE_DB_CACHE_DIR="$OUTPUT_DIR/grype-db"   # keep DB off the flash drive
+export PATH="$BIN:$PATH"
+
+log()    { echo "[$(date '+%F %T')] $*" | tee -a "$RUN_DIR/scan.log" >&2; logger -t "$PLUGIN" -- "$*"; }
+notify() { [[ -x $NOTIFY_BIN ]] && "$NOTIFY_BIN" -e "SBOM Generator" -s "$1" -d "$2" -i "$3" >/dev/null 2>&1; true; }
+safe()   { tr -c 'A-Za-z0-9._-' '_' <<<"$1" | sed 's/_*$//'; }
+
+# --- single instance --------------------------------------------------------
+exec 9>"$LOCK"
+if ! flock -n 9; then
+  logger -t "$PLUGIN" "scan already running, skipping"
+  exit 0
+fi
+
+# --- preflight --------------------------------------------------------------
+if [[ $OUTPUT_DIR == /mnt/* ]] && ! mountpoint -q "/mnt/$(cut -d/ -f3 <<<"$OUTPUT_DIR")"; then
+  logger -t "$PLUGIN" "output location $OUTPUT_DIR is not mounted (array stopped?)"
+  notify "Scan skipped" "Output location $OUTPUT_DIR is not available. Is the array started?" warning
+  exit 1
+fi
+for b in syft grype; do
+  if [[ ! -x $BIN/$b ]]; then
+    logger -t "$PLUGIN" "$b missing from $BIN; reinstall the plugin"
+    notify "Scan failed" "$b is not installed. Use 'Update tools' on the settings page." alert
+    exit 1
+  fi
+done
+
+STAMP=$(date +%Y%m%d-%H%M%S)
+RUN_DIR="$OUTPUT_DIR/runs/$STAMP"
+mkdir -p "$RUN_DIR/sbom" "$RUN_DIR/vulns" "$GRYPE_DB_CACHE_DIR"
+echo "running $STAMP" >"$OUTPUT_DIR/status"
+log "scan started -> $RUN_DIR"
+ERRORS=0
+
+# --- 1. Unraid host OS (Slackware packages, kernel, Unraid release) ----------
+if [[ $SCAN_HOST_OS == yes ]]; then
+  if php "$EMHTTP/scripts/host-sbom.php" >"$RUN_DIR/sbom/unraid-host-os.cdx.json" 2>>"$RUN_DIR/scan.log"; then
+    log "host OS SBOM: $(grep -c '"bom-ref"' "$RUN_DIR/sbom/unraid-host-os.cdx.json") components"
+  else
+    log "host OS SBOM failed"; rm -f "$RUN_DIR/sbom/unraid-host-os.cdx.json"; ((ERRORS++))
+  fi
+fi
+
+# --- 2. Host filesystem (language packages, binaries Syft recognises) --------
+if [[ $SCAN_HOST_FS == yes ]]; then
+  if syft scan dir:/ -q \
+       --exclude './mnt/**' --exclude './proc/**' --exclude './sys/**' \
+       --exclude './dev/**' --exclude './run/**'  --exclude './tmp/**' \
+       --exclude './boot/**' --exclude './var/lib/docker/**' \
+       --exclude './var/lib/libvirt/**' --exclude './usr/local/sbomgen/**' \
+       --source-name unraid-host-fs \
+       -o "cyclonedx-json=$RUN_DIR/sbom/unraid-host-fs.cdx.json" 2>>"$RUN_DIR/scan.log"; then
+    log "host filesystem SBOM done"
+  else
+    log "host filesystem SBOM failed"; ((ERRORS++))
+  fi
+fi
+
+# --- 3. Containers (one SBOM per image in use, named after its container) -----
+if [[ $SCAN_CONTAINERS == yes ]] && command -v docker >/dev/null && docker info >/dev/null 2>&1; then
+  declare -A SEEN=()
+  while IFS=$'\t' read -r name image imageid; do
+    [[ -z $name ]] && continue
+    if [[ -n ${SEEN[$imageid]:-} ]]; then
+      log "container $name shares image with ${SEEN[$imageid]}, skipping duplicate"
+      continue
+    fi
+    SEEN[$imageid]=$name
+    out="$RUN_DIR/sbom/container-$(safe "$name").cdx.json"
+    if syft scan "docker:$imageid" -q --source-name "$name" --source-version "$image" \
+         -o "cyclonedx-json=$out" 2>>"$RUN_DIR/scan.log"; then
+      log "container $name ($image) done"
+    else
+      log "container $name ($image) failed"; ((ERRORS++))
+    fi
+  done < <(docker ps -a --format '{{.Names}}' | while read -r c; do
+             docker inspect --format '{{.Name}}{{"\t"}}{{.Config.Image}}{{"\t"}}{{.Image}}' "$c" | sed 's#^/##'
+           done)
+elif [[ $SCAN_CONTAINERS == yes ]]; then
+  log "Docker is not running; container SBOMs skipped"
+fi
+
+# --- 4. Vulnerability scan ---------------------------------------------------
+if [[ $VULN_SCAN == yes ]]; then
+  if grype db update -q 2>>"$RUN_DIR/scan.log"; then
+    log "grype database updated"
+  else
+    log "grype database update failed; using cached database if present"
+  fi
+  if curl -fsSL --max-time 60 -o "$RUN_DIR/kev.json.tmp" \
+       https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json; then
+    mv "$RUN_DIR/kev.json.tmp" "$OUTPUT_DIR/kev.json"
+  else
+    rm -f "$RUN_DIR/kev.json.tmp"
+    log "CISA KEV download failed; using cached copy if present"
+  fi
+  for sbom in "$RUN_DIR"/sbom/*.cdx.json; do
+    [[ -e $sbom ]] || continue
+    base=$(basename "$sbom" .cdx.json)
+    if ! grype "sbom:$sbom" -q -o "json=$RUN_DIR/vulns/$base.json" 2>>"$RUN_DIR/scan.log"; then
+      log "grype failed on $base"; ((ERRORS++))
+    fi
+  done
+  PREV=$(readlink -f "$OUTPUT_DIR/latest" 2>/dev/null || true)
+  SUMMARY_LINE=$(php "$EMHTTP/scripts/summarize.php" "$RUN_DIR" "$OUTPUT_DIR/kev.json" "${PREV:-}" 2>>"$RUN_DIR/scan.log")
+  log "summary: $SUMMARY_LINE"
+fi
+
+# --- 5. Dependency-Track upload -----------------------------------------------
+if [[ -n ${DT_URL:-} && -n ${DT_API_KEY:-} ]]; then
+  for sbom in "$RUN_DIR"/sbom/*.cdx.json; do
+    [[ -e $sbom ]] || continue
+    project=$(basename "$sbom" .cdx.json)
+    code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 120 \
+             -X POST "${DT_URL%/}/api/v1/bom" -H "X-Api-Key: $DT_API_KEY" \
+             -F autoCreate=true -F "projectName=$project" -F projectVersion=current \
+             -F "bom=@$sbom" 2>>"$RUN_DIR/scan.log")
+    if [[ $code == 200 ]]; then log "uploaded $project to Dependency-Track"
+    else log "Dependency-Track upload of $project failed (HTTP $code)"; ((ERRORS++)); fi
+  done
+fi
+
+# --- 6. Finish: latest link, retention, notification -------------------------
+ln -sfn "$RUN_DIR" "$OUTPUT_DIR/latest"
+if [[ ${KEEP_RUNS:-0} =~ ^[0-9]+$ && $KEEP_RUNS -gt 0 ]]; then
+  find "$OUTPUT_DIR/runs" -mindepth 1 -maxdepth 1 -type d | sort -r | tail -n +$((KEEP_RUNS + 1)) | xargs -r rm -rf
+fi
+echo "finished $STAMP errors=$ERRORS ${SUMMARY_LINE:-}" >"$OUTPUT_DIR/status"
+log "scan finished with $ERRORS error(s)"
+
+if [[ -n ${SUMMARY_LINE:-} ]]; then
+  # summarize.php line format: "new=N new_kev=N new_crit=N critical=N high=N kev=N"
+  declare -A S=()
+  for kv in $SUMMARY_LINE; do S[${kv%%=*}]=${kv#*=}; done
+  level=normal
+  (( ${S[new_kev]:-0} > 0 || ${S[new_crit]:-0} > 0 )) && level=alert
+  msg="New: ${S[new]:-0} (KEV ${S[new_kev]:-0}, critical ${S[new_crit]:-0}). Totals: critical ${S[critical]:-0}, high ${S[high]:-0}, KEV ${S[kev]:-0}. Report: $RUN_DIR/summary.md"
+  case $NOTIFY in
+    always) notify "Scan complete" "$msg" "$level" ;;
+    new)    (( ${S[new]:-0} > 0 )) && notify "New vulnerabilities found" "$msg" "$level" ;;
+  esac
+fi
+(( ERRORS > 0 )) && [[ $NOTIFY != off ]] && notify "Scan finished with errors" "$ERRORS step(s) failed. See $RUN_DIR/scan.log" warning
+exit 0
+]]></INLINE>
+</FILE>
+
+<FILE Name="/usr/local/emhttp/plugins/&name;/scripts/summarize.php" Mode="0644">
+<INLINE><![CDATA[
+<?php
+// Summarizes Grype results for one run: tags CISA KEV entries, flags findings
+// that weren't in the previous run, writes summary.json + summary.md, and
+// prints one line of counts for the notification.
+//
+// Usage: php summarize.php <run_dir> <kev.json> [previous_run_dir]
+
+[$_, $runDir, $kevFile] = $argv + [null, null, null];
+$prevDir = $argv[3] ?? '';
+if (!$runDir || !is_dir($runDir)) { fwrite(STDERR, "run dir missing\n"); exit(1); }
+
+$kev = [];
+if ($kevFile && is_readable($kevFile)) {
+  foreach (json_decode(file_get_contents($kevFile), true)['vulnerabilities'] ?? [] as $v) {
+    $kev[$v['cveID']] = $v['dueDate'] ?? '';
+  }
+}
+
+$rank = ['Critical' => 0, 'High' => 1, 'Medium' => 2, 'Low' => 3, 'Negligible' => 4, 'Unknown' => 5];
+$findings = [];
+foreach (glob("$runDir/vulns/*.json") ?: [] as $f) {
+  $target = basename($f, '.json');
+  foreach (json_decode(file_get_contents($f), true)['matches'] ?? [] as $m) {
+    $v   = $m['vulnerability'];
+    $ids = array_merge([$v['id']], array_column($m['relatedVulnerabilities'] ?? [], 'id'));
+    $cve = current(array_filter($ids, fn($i) => str_starts_with($i, 'CVE-'))) ?: $v['id'];
+    $key = "$target|{$m['artifact']['name']}|{$m['artifact']['version']}|$cve";
+    if (isset($findings[$key])) continue;
+    $findings[$key] = [
+      'target'   => $target,
+      'id'       => $cve,
+      'severity' => $v['severity'] ?? 'Unknown',
+      'package'  => $m['artifact']['name'],
+      'version'  => $m['artifact']['version'],
+      'fixed_in' => implode(', ', $v['fix']['versions'] ?? []),
+      'kev'      => isset($kev[$cve]),
+      'new'      => true,
+    ];
+  }
+}
+
+// Mark which findings existed last run.
+$prevKeys = [];
+if ($prevDir && is_readable("$prevDir/summary.json")) {
+  foreach (json_decode(file_get_contents("$prevDir/summary.json"), true)['findings'] ?? [] as $p) {
+    $prevKeys["{$p['target']}|{$p['package']}|{$p['version']}|{$p['id']}"] = true;
+  }
+  foreach ($findings as $k => &$fd) $fd['new'] = !isset($prevKeys[$k]);
+  unset($fd);
+}
+
+$list = array_values($findings);
+usort($list, fn($a, $b) =>
+  [$b['kev'], $b['new'], $rank[$a['severity']] ?? 9, $a['target']] <=>
+  [$a['kev'], $a['new'], $rank[$b['severity']] ?? 9, $b['target']]);
+
+$count = fn($pred) => count(array_filter($list, $pred));
+$stats = [
+  'new'      => $count(fn($f) => $f['new']),
+  'new_kev'  => $count(fn($f) => $f['new'] && $f['kev']),
+  'new_crit' => $count(fn($f) => $f['new'] && $f['severity'] === 'Critical'),
+  'critical' => $count(fn($f) => $f['severity'] === 'Critical'),
+  'high'     => $count(fn($f) => $f['severity'] === 'High'),
+  'kev'      => $count(fn($f) => $f['kev']),
+  'total'    => count($list),
+];
+
+file_put_contents("$runDir/summary.json", json_encode(
+  ['generated' => gmdate('c'), 'baseline' => $prevDir ?: null, 'stats' => $stats, 'findings' => $list],
+  JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+
+// Markdown report: KEV and new findings first, then everything Critical/High.
+$row = fn($f) => sprintf("| %s | %s | %s | %s %s | %s | %s |\n",
+  $f['kev'] ? '**KEV**' : '', $f['severity'], $f['id'], $f['package'], $f['version'],
+  $f['fixed_in'] ?: '-', $f['target']);
+$head = "| | Severity | ID | Package | Fixed in | Target |\n|---|---|---|---|---|---|\n";
+
+$md  = "# SBOM scan " . basename($runDir) . "\n\n";
+$md .= $prevDir ? "Compared with " . basename($prevDir) . ".\n\n" : "First run, so everything counts as new.\n\n";
+$md .= "New: {$stats['new']} (KEV {$stats['new_kev']}, critical {$stats['new_crit']}). ";
+$md .= "Totals: {$stats['total']} findings, {$stats['critical']} critical, {$stats['high']} high, {$stats['kev']} in CISA KEV.\n\n";
+$sections = [
+  'Known exploited (CISA KEV)' => fn($f) => $f['kev'],
+  'New since last run'         => fn($f) => $f['new'] && !$f['kev'],
+  'All critical and high'      => fn($f) => !$f['new'] && !$f['kev'] && in_array($f['severity'], ['Critical', 'High']),
+];
+foreach ($sections as $title => $pred) {
+  $rows = array_filter($list, $pred);
+  $md .= "## $title (" . count($rows) . ")\n\n";
+  $md .= $rows ? $head . implode('', array_map($row, $rows)) . "\n" : "None.\n\n";
+}
+file_put_contents("$runDir/summary.md", $md);
+
+echo implode(' ', array_map(fn($k, $v) => "$k=$v", array_keys($stats), $stats)), "\n";
+]]></INLINE>
+</FILE>
+
+<!-- Install: fetch/verify Syft and Grype (cached on flash), set up the schedule -->
+<FILE Run="/bin/bash">
+<INLINE>
+/usr/local/emhttp/plugins/&name;/scripts/install-tools.sh || echo "WARNING: tools missing. Check network, then use 'Update tools' in Settings > SBOM Generator."
+/usr/local/emhttp/plugins/&name;/scripts/apply.sh
+echo ""
+echo "SBOM Generator &version; installed. Configure it under Settings > Utilities > SBOM Generator."
+</INLINE>
+</FILE>
+
+<!-- Remove: drop schedule, runtime files and config. Reports on your share are kept. -->
+<FILE Run="/bin/bash" Method="remove">
+<INLINE>
+rm -f /boot/config/plugins/&name;/&name;.cron
+/usr/local/sbin/update_cron
+rm -rf /usr/local/emhttp/plugins/&name; /usr/local/&name; /boot/config/plugins/&name;
+echo "SBOM Generator removed. Existing SBOMs and reports were left in place."
+</INLINE>
+</FILE>
+
+</PLUGIN>

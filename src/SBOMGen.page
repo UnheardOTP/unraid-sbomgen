@@ -1,0 +1,127 @@
+Menu="Utilities"
+Title="SBOM Generator"
+Icon="list-alt"
+---
+<?php
+$cfg = parse_plugin_cfg('sbomgen');
+$h   = fn($s) => htmlspecialchars((string)$s, ENT_QUOTES);
+$out = rtrim($cfg['OUTPUT_DIR'], '/');
+
+$tool = function ($t) {
+  $v = @shell_exec("/usr/local/sbomgen/bin/$t version 2>/dev/null | awk '/^Version:/{print \$2}'");
+  return trim((string)$v) ?: 'not installed';
+};
+$status = trim((string)@file_get_contents("$out/status")) ?: 'no scans yet';
+// "finished 20261023-170950 errors=0 new=..." -> "finished 2026-10-23 17:09:50, 0 errors"
+if (preg_match('/^(running|finished) (\d{4})(\d\d)(\d\d)-(\d\d)(\d\d)(\d\d)(?: errors=(\d+))?/', $status, $m)) {
+  $status = "$m[1] $m[2]-$m[3]-$m[4] $m[5]:$m[6]:$m[7]" . (isset($m[8]) ? ", $m[8] error" . ($m[8] === '1' ? '' : 's') : '');
+}
+$stats  = json_decode((string)@file_get_contents("$out/latest/summary.json"), true)['stats'] ?? null;
+$sel    = fn($k, $v) => ($cfg[$k] ?? '') === (string)$v ? ' selected' : '';
+$days   = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+?>
+<style>
+.sbom-stat{display:inline-block;margin-right:2em}
+.sbom-stat b{font-size:1.4em}
+.sbom-kev b{color:#e22828}
+</style>
+
+<div markdown="1">
+**Status:** <?=$h($status)?>
+&nbsp;·&nbsp; Syft <?=$h($tool('syft'))?> &nbsp;·&nbsp; Grype <?=$h($tool('grype'))?>
+
+<?if ($stats):?>
+<span class="sbom-stat sbom-kev"><b><?=$h($stats['kev'])?></b> known exploited</span>
+<span class="sbom-stat"><b><?=$h($stats['critical'])?></b> critical</span>
+<span class="sbom-stat"><b><?=$h($stats['high'])?></b> high</span>
+<span class="sbom-stat"><b><?=$h($stats['new'])?></b> new since previous scan</span>
+
+Latest report: <code><?=$h("$out/latest/summary.md")?></code>
+
+<input type="button" value="Download report" title="Markdown summary: KEV and new findings first" onclick="location.href='/plugins/sbomgen/download.php?f=md'">
+<input type="button" value="Download findings (CSV)" title="Every finding, for sorting and filtering in a spreadsheet" onclick="location.href='/plugins/sbomgen/download.php?f=csv'">
+<input type="button" value="Download everything" title="SBOMs, Grype results, report and log as .tar.gz" onclick="location.href='/plugins/sbomgen/download.php?f=tgz'">
+<?endif;?>
+</div>
+
+<form markdown="1" method="POST" action="/update.php" target="progressFrame">
+<input type="hidden" name="#command" value="/plugins/sbomgen/scripts/action.sh">
+<input type="hidden" name="#arg[1]" value="scan">
+&nbsp;
+: <input type="submit" value="Scan now"> <span class="inline-help">Runs in the background; refresh this page to see the result.</span>
+</form>
+
+<form markdown="1" method="POST" action="/update.php" target="progressFrame">
+<input type="hidden" name="#command" value="/plugins/sbomgen/scripts/action.sh">
+<input type="hidden" name="#arg[1]" value="update">
+&nbsp;
+: <input type="submit" value="Update tools"> <span class="inline-help">Fetches the latest Syft and Grype releases and verifies their checksums.</span>
+</form>
+
+<form markdown="1" method="POST" action="/update.php" target="progressFrame">
+<input type="hidden" name="#file" value="sbomgen/sbomgen.cfg">
+<input type="hidden" name="#command" value="/plugins/sbomgen/scripts/apply.sh">
+
+### What to inventory
+
+Unraid OS packages:
+: <select name="SCAN_HOST_OS"><option value="yes"<?=$sel('SCAN_HOST_OS','yes')?>>Yes</option><option value="no"<?=$sel('SCAN_HOST_OS','no')?>>No</option></select>
+
+> Slackware packages, kernel and Unraid release, built directly from the package database.
+
+Host filesystem:
+: <select name="SCAN_HOST_FS"><option value="yes"<?=$sel('SCAN_HOST_FS','yes')?>>Yes</option><option value="no"<?=$sel('SCAN_HOST_FS','no')?>>No</option></select>
+
+> Syft scan of the root filesystem (Python, Go, Java and other artifacts outside the package database). Excludes /mnt, /boot and Docker/VM storage.
+
+Docker containers:
+: <select name="SCAN_CONTAINERS"><option value="yes"<?=$sel('SCAN_CONTAINERS','yes')?>>Yes</option><option value="no"<?=$sel('SCAN_CONTAINERS','no')?>>No</option></select>
+
+> One SBOM per image in use, including stopped containers.
+
+### Vulnerability scanning
+
+Scan with Grype:
+: <select name="VULN_SCAN"><option value="yes"<?=$sel('VULN_SCAN','yes')?>>Yes</option><option value="no"<?=$sel('VULN_SCAN','no')?>>No (SBOMs only)</option></select>
+
+Notify:
+: <select name="NOTIFY">
+  <option value="new"<?=$sel('NOTIFY','new')?>>When new vulnerabilities appear</option>
+  <option value="always"<?=$sel('NOTIFY','always')?>>After every scan</option>
+  <option value="off"<?=$sel('NOTIFY','off')?>>Never</option>
+  </select>
+
+### Schedule
+
+Run:
+: <select name="SCHEDULE"><option value="daily"<?=$sel('SCHEDULE','daily')?>>Daily</option><option value="weekly"<?=$sel('SCHEDULE','weekly')?>>Weekly</option><option value="off"<?=$sel('SCHEDULE','off')?>>Manually only</option></select>
+
+Day (weekly):
+: <select name="SCHED_DOW"><?foreach($days as $i=>$d):?><option value="<?=$i?>"<?=$sel('SCHED_DOW',$i)?>><?=$d?></option><?endforeach;?></select>
+
+Time (24h):
+: <input type="number" name="SCHED_HOUR" min="0" max="23" value="<?=$h($cfg['SCHED_HOUR'])?>" style="width:5em"> : <input type="number" name="SCHED_MIN" min="0" max="59" value="<?=$h($cfg['SCHED_MIN'])?>" style="width:5em">
+
+### Storage
+
+Output folder:
+: <input type="text" name="OUTPUT_DIR" value="<?=$h($cfg['OUTPUT_DIR'])?>" style="width:24em">
+
+> Use a share on the array or a pool. The Grype database (several hundred MB) lives here too, never on the flash drive.
+
+Keep runs:
+: <input type="number" name="KEEP_RUNS" min="0" value="<?=$h($cfg['KEEP_RUNS'])?>" style="width:5em"> <span class="inline-help">0 keeps everything</span>
+
+### Dependency-Track (optional)
+
+Server URL:
+: <input type="text" name="DT_URL" value="<?=$h($cfg['DT_URL'])?>" placeholder="http://tower:8081" style="width:24em">
+
+API key:
+: <input type="password" name="DT_API_KEY" value="<?=$h($cfg['DT_API_KEY'])?>" autocomplete="off" style="width:24em">
+
+> Needs BOM_UPLOAD and PROJECT_CREATION_UPLOAD permissions. Each SBOM becomes its own project, versioned "current" so it updates in place.
+
+&nbsp;
+: <input type="submit" name="#apply" value="Apply"><input type="button" value="Done" onclick="done()">
+</form>
